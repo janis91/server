@@ -25,10 +25,12 @@ use Leafo\ScssPhp\Compiler;
 use Leafo\ScssPhp\Exception\ParserException;
 use Leafo\ScssPhp\Formatter\Crunched;
 use Leafo\ScssPhp\Formatter\Expanded;
-use OC\SystemConfig;
+
+use OC\Files\AppData\Factory;
 use OCP\Files\IAppData;
 use OCP\Files\NotFoundException;
 use OCP\Files\NotPermittedException;
+use OCP\Files\SimpleFS\ISimpleFile;
 use OCP\Files\SimpleFS\ISimpleFolder;
 use OCP\ICache;
 use OCP\IConfig;
@@ -57,22 +59,25 @@ class SCSSCacher {
 
 	/**
 	 * @param ILogger $logger
-	 * @param IAppData $appData
+	 * @param Factory $appDataFactory
 	 * @param IURLGenerator $urlGenerator
 	 * @param IConfig $config
+	 * @param \OC_Defaults $defaults
 	 * @param string $serverRoot
 	 * @param ICache $depsCache
 	 */
 	public function __construct(ILogger $logger,
-								IAppData $appData,
+								Factory $appDataFactory,
 								IURLGenerator $urlGenerator,
 								IConfig $config,
+								\OC_Defaults $defaults,
 								$serverRoot,
 								ICache $depsCache) {
 		$this->logger = $logger;
-		$this->appData = $appData;
+		$this->appData = $appDataFactory->get('css');
 		$this->urlGenerator = $urlGenerator;
 		$this->config = $config;
+		$this->defaults = $defaults;
 		$this->serverRoot = $serverRoot;
 		$this->depsCache = $depsCache;
 	}
@@ -101,10 +106,21 @@ class SCSSCacher {
 			$folder = $this->appData->newFolder($app);
 		}
 
-		if($this->isCached($fileNameCSS, $folder)) {
+
+		if(!$this->variablesChanged() && $this->isCached($fileNameCSS, $folder)) {
 			return true;
 		}
 		return $this->cache($path, $fileNameCSS, $fileNameSCSS, $folder, $webDir);
+	}
+
+	/**
+	 * @param $appName
+	 * @param $fileName
+	 * @return ISimpleFile
+	 */
+	public function getCachedCSS($appName, $fileName) {
+		$folder = $this->appData->getFolder($appName);
+		return $folder->getFile($fileName);
 	}
 
 	/**
@@ -137,6 +153,20 @@ class SCSSCacher {
 		} catch(NotFoundException $e) {
 			return false;
 		}
+	}
+
+	/**
+	 * Check if the variables file has changed
+	 * @return bool
+	 */
+	private function variablesChanged() {
+		$injectedVariables = $this->getInjectedVariables();
+		if($this->config->getAppValue('core', 'scss.variables') !== md5($injectedVariables)) {
+			$this->resetCache();
+			$this->config->setAppValue('core', 'scss.variables', md5($injectedVariables));
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -180,6 +210,7 @@ class SCSSCacher {
 		try {
 			$compiledScss = $scss->compile(
 				'@import "variables.scss";' .
+				$this->getInjectedVariables() .
 				'@import "'.$fileNameSCSS.'";');
 		} catch(ParserException $e) {
 			$this->logger->error($e, ['app' => 'core']);
@@ -203,6 +234,35 @@ class SCSSCacher {
 		} catch(NotPermittedException $e) {
 			return false;
 		}
+	}
+
+	/**
+	 * Reset scss cache by deleting all generated css files
+	 * We need to regenerate all files when variables change
+	 */
+	private function resetCache() {
+		$appDirectory = $this->appData->getDirectoryListing();
+		if(empty($appDirectory)){
+			return;
+		}
+		foreach ($appDirectory as $folder) {
+			foreach ($folder->getDirectoryListing() as $file) {
+				if (substr($file->getName(), -3) === "css" || substr($file->getName(), -4) === "deps") {
+					$file->delete();
+				}
+			}
+		}
+	}
+
+	/**
+	 * @return string SCSS code for variables from OC_Defaults
+	 */
+	private function getInjectedVariables() {
+		$variables = '';
+		foreach ($this->defaults->getScssVariables() as $key => $value) {
+			$variables .= '$' . $key . ': ' . $value . ';';
+		}
+		return $variables;
 	}
 
 	/**
